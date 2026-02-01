@@ -7,11 +7,11 @@ Perplexity AI provider for Amplifier, enabling web-grounded AI search with real-
 ### Option 1: Amplifier CLI (Recommended)
 
 ```bash
-# Install the provider module
-amplifier provider install perplexity --source git+https://github.com/colombod/amplifier-module-provider-perplexity@main
+# Add the provider module
+amplifier module add provider-perplexity --source git+https://github.com/colombod/amplifier-module-provider-perplexity@main
 
 # Verify installation
-amplifier provider list
+amplifier module list
 ```
 
 ### Option 2: In Your Bundle
