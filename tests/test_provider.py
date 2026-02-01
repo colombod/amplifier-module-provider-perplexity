@@ -5,7 +5,10 @@ Tests cover:
 - Response parsing with citations
 - Provider info and model listing
 - Error handling
+- SDK client lifecycle
 """
+
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -98,7 +101,7 @@ class TestMessageConversion:
         assert "</context_file>" in conversation[0]["content"]
 
     def test_convert_tool_message_skipped(self) -> None:
-        """Tool messages should be skipped (not supported)."""
+        """Tool messages should be skipped (not supported by Perplexity)."""
 
         class MockMessage:
             role = "tool"
@@ -108,7 +111,7 @@ class TestMessageConversion:
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt is None
-        assert conversation == []
+        assert len(conversation) == 0
 
     def test_convert_mixed_messages(self) -> None:
         """Mixed message types should be handled correctly."""
@@ -119,11 +122,11 @@ class TestMessageConversion:
 
         class UserMsg:
             role = "user"
-            content = "Hi"
+            content = "Hello"
 
         class AssistantMsg:
             role = "assistant"
-            content = "Hello!"
+            content = "Hi there!"
 
         class UserMsg2:
             role = "user"
@@ -134,8 +137,8 @@ class TestMessageConversion:
 
         assert system_prompt == "Be helpful."
         assert len(conversation) == 3
-        assert conversation[0] == {"role": "user", "content": "Hi"}
-        assert conversation[1] == {"role": "assistant", "content": "Hello!"}
+        assert conversation[0] == {"role": "user", "content": "Hello"}
+        assert conversation[1] == {"role": "assistant", "content": "Hi there!"}
         assert conversation[2] == {"role": "user", "content": "How are you?"}
 
 
@@ -151,15 +154,25 @@ class TestTextExtraction:
         result = self.provider._extract_text_content("Hello world")
         assert result == "Hello world"
 
-    def test_extract_from_dict_blocks(self) -> None:
-        """Dictionary content blocks should be extracted."""
+    def test_extract_dict_text_blocks(self) -> None:
+        """Dict text blocks should be extracted."""
         content = [
-            {"type": "text", "text": "First part"},
-            {"type": "text", "text": "Second part"},
+            {"type": "text", "text": "Hello"},
+            {"type": "text", "text": "World"},
         ]
         result = self.provider._extract_text_content(content)
-        assert "First part" in result
-        assert "Second part" in result
+        assert result == "Hello\nWorld"
+
+    def test_extract_textblock_objects(self) -> None:
+        """TextBlock objects should be extracted."""
+        from amplifier_core.message_models import TextBlock
+
+        content = [
+            TextBlock(type="text", text="Hello"),
+            TextBlock(type="text", text="World"),
+        ]
+        result = self.provider._extract_text_content(content)
+        assert result == "Hello\nWorld"
 
     def test_extract_empty_list(self) -> None:
         """Empty list should return empty string."""
@@ -167,89 +180,103 @@ class TestTextExtraction:
         assert result == ""
 
 
-class TestResponseParsing:
-    """Test conversion of Perplexity API responses."""
+class TestSDKResponseConversion:
+    """Test conversion of SDK responses to Amplifier format."""
 
     def setup_method(self) -> None:
         """Set up test provider instance."""
         self.provider = PerplexityProvider(api_key="test-key")
 
-    def test_parse_basic_response(self) -> None:
-        """Basic response should be parsed correctly."""
-        data = {
-            "choices": [
-                {
-                    "message": {"content": "This is the response."},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 20,
-                "total_tokens": 30,
-            },
-        }
+    def _create_mock_response(
+        self,
+        content: str = "Test response",
+        model: str = "sonar",
+        prompt_tokens: int = 10,
+        completion_tokens: int = 20,
+        finish_reason: str = "stop",
+        citations: list | None = None,
+        response_id: str = "test-id",
+    ) -> MagicMock:
+        """Create a mock SDK response object."""
+        mock_response = MagicMock()
+        mock_response.id = response_id
+        mock_response.model = model
 
-        response = self.provider._convert_to_chat_response(data)
+        # Mock choice
+        mock_choice = MagicMock()
+        mock_choice.message = MagicMock()
+        mock_choice.message.content = content
+        mock_choice.finish_reason = finish_reason
+        mock_response.choices = [mock_choice]
 
-        assert len(response.content) == 1
-        assert response.content[0].text == "This is the response."
-        assert response.finish_reason == "stop"
-        assert response.usage is not None
+        # Mock usage
+        mock_response.usage = MagicMock()
+        mock_response.usage.prompt_tokens = prompt_tokens
+        mock_response.usage.completion_tokens = completion_tokens
+
+        # Mock citations
+        mock_response.citations = citations
+
+        return mock_response
+
+    def test_convert_basic_response(self) -> None:
+        """Basic response should be converted correctly."""
+        mock_response = self._create_mock_response(
+            content="The capital of France is Paris.",
+            model="sonar",
+            prompt_tokens=10,
+            completion_tokens=20,
+        )
+
+        response = self.provider._convert_sdk_response(mock_response, "sonar")
+
+        assert response.model == "sonar"
+        assert "The capital of France is Paris." in response.content[0].text
         assert response.usage.input_tokens == 10
         assert response.usage.output_tokens == 20
-        assert response.usage.total_tokens == 30
 
-    def test_parse_response_with_citations(self) -> None:
-        """Response with citations should include them in metadata."""
-        data = {
-            "choices": [
-                {
-                    "message": {"content": "Paris is the capital [1]."},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
-            "citations": [{"url": "https://example.com/paris", "title": "Paris Facts"}],
-        }
+    def test_convert_response_with_citations(self) -> None:
+        """Response with citations should include them in content."""
+        mock_response = self._create_mock_response(
+            content="Paris is the capital.",
+            citations=["https://example.com/paris", "https://wiki.org/france"],
+        )
 
-        response = self.provider._convert_to_chat_response(data)
+        response = self.provider._convert_sdk_response(mock_response, "sonar")
 
-        assert response.metadata is not None
-        assert "citations" in response.metadata
-        assert len(response.metadata["citations"]) == 1
-        assert response.metadata["citations"][0]["url"] == "https://example.com/paris"
+        assert "Paris is the capital." in response.content[0].text
+        assert "Sources:" in response.content[0].text
+        assert "https://example.com/paris" in response.content[0].text
+        assert "https://wiki.org/france" in response.content[0].text
 
-    def test_parse_response_with_related_questions(self) -> None:
-        """Response with related questions should include them in metadata."""
-        data = {
-            "choices": [
-                {
-                    "message": {"content": "The answer is 42."},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
-            "related_questions": [
-                "What is the meaning of life?",
-                "Why 42?",
-            ],
-        }
+    def test_convert_response_stop_reason_length(self) -> None:
+        """Length finish reason should map to max_tokens."""
+        mock_response = self._create_mock_response(finish_reason="length")
 
-        response = self.provider._convert_to_chat_response(data)
+        response = self.provider._convert_sdk_response(mock_response, "sonar")
 
-        assert response.metadata is not None
-        assert "related_questions" in response.metadata
-        assert len(response.metadata["related_questions"]) == 2
+        assert response.stop_reason == "max_tokens"
 
-    def test_parse_empty_choices(self) -> None:
-        """Empty choices should return empty response."""
-        data = {"choices": [], "usage": {}}
+    def test_convert_response_stop_reason_stop(self) -> None:
+        """Stop finish reason should map to end_turn."""
+        mock_response = self._create_mock_response(finish_reason="stop")
 
-        response = self.provider._convert_to_chat_response(data)
+        response = self.provider._convert_sdk_response(mock_response, "sonar")
+
+        assert response.stop_reason == "end_turn"
+
+    def test_convert_empty_choices(self) -> None:
+        """Empty choices should return empty content."""
+        mock_response = MagicMock()
+        mock_response.id = "test-id"
+        mock_response.model = "sonar"
+        mock_response.choices = []
+        mock_response.usage = None
+        mock_response.citations = None
+
+        response = self.provider._convert_sdk_response(mock_response, "sonar")
 
         assert response.content[0].text == ""
-        assert response.finish_reason == "error"
 
 
 class TestProviderInfo:
@@ -347,29 +374,71 @@ class TestToolCalls:
 
         class MockResponse:
             content = []
-            usage = None
-            finish_reason = "stop"
-            metadata = None
 
         result = self.provider.parse_tool_calls(MockResponse())
         assert result == []
 
 
+class TestClientLifecycle:
+    """Test SDK client initialization and cleanup."""
+
+    def test_client_not_initialized_on_construction(self) -> None:
+        """Client should not be initialized until accessed."""
+        provider = PerplexityProvider(api_key="test-key")
+        assert provider._client is None
+
+    def test_client_requires_api_key(self) -> None:
+        """Accessing client without API key should raise ValueError."""
+        provider = PerplexityProvider(api_key=None)
+        with pytest.raises(ValueError, match="api_key must be provided"):
+            _ = provider.client
+
+    def test_client_lazy_initialization(self) -> None:
+        """Client should be initialized on first access."""
+        provider = PerplexityProvider(api_key="test-key")
+        client = provider.client
+        assert client is not None
+        assert provider._client is not None
+
+    def test_client_reused_on_subsequent_access(self) -> None:
+        """Same client instance should be returned on subsequent access."""
+        provider = PerplexityProvider(api_key="test-key")
+        client1 = provider.client
+        client2 = provider.client
+        assert client1 is client2
+
+    @pytest.mark.asyncio
+    async def test_close_method(self) -> None:
+        """Close method should cleanup client."""
+        provider = PerplexityProvider(api_key="test-key")
+        _ = provider.client  # Initialize
+        assert provider._client is not None
+
+        await provider.close()
+        assert provider._client is None
+
+    @pytest.mark.asyncio
+    async def test_context_manager(self) -> None:
+        """Context manager should cleanup on exit."""
+        async with PerplexityProvider(api_key="test-key") as provider:
+            _ = provider.client
+            assert provider._client is not None
+
+        assert provider._client is None
+
+
 class TestConfiguration:
-    """Test provider configuration handling."""
+    """Test provider configuration."""
 
     def test_default_configuration(self) -> None:
-        """Provider should have sensible defaults."""
+        """Provider should use sensible defaults."""
         provider = PerplexityProvider(api_key="test-key")
 
         assert provider.default_model == "sonar"
         assert provider.max_tokens == 4096
         assert provider.temperature == 0.7
         assert provider.timeout == 60.0
-        assert provider.max_retries == 3
-        assert provider.search_context_size == "medium"
-        assert provider.return_images is False
-        assert provider.return_related_questions is False
+        assert provider.max_retries == 2
 
     def test_custom_configuration(self) -> None:
         """Provider should accept custom configuration."""
@@ -378,9 +447,9 @@ class TestConfiguration:
             "max_tokens": 8192,
             "temperature": 0.5,
             "timeout": 120.0,
+            "max_retries": 5,
             "search_recency_filter": "week",
             "search_context_size": "high",
-            "return_images": True,
         }
         provider = PerplexityProvider(api_key="test-key", config=config)
 
@@ -388,84 +457,45 @@ class TestConfiguration:
         assert provider.max_tokens == 8192
         assert provider.temperature == 0.5
         assert provider.timeout == 120.0
+        assert provider.max_retries == 5
         assert provider.search_recency_filter == "week"
         assert provider.search_context_size == "high"
-        assert provider.return_images is True
-
-    def test_client_lazy_initialization(self) -> None:
-        """HTTP client should be lazily initialized."""
-        provider = PerplexityProvider(api_key="test-key")
-
-        assert provider._client is None
-
-    def test_client_raises_without_api_key(self) -> None:
-        """Accessing client without API key should raise ValueError."""
-        provider = PerplexityProvider(api_key=None)
-
-        with pytest.raises(ValueError, match="api_key must be provided"):
-            _ = provider.client
 
 
-class TestRequestBuilding:
-    """Test request parameter building."""
+class TestMount:
+    """Test the mount() function."""
 
-    def setup_method(self) -> None:
-        """Set up test provider instance."""
-        self.provider = PerplexityProvider(
-            api_key="test-key",
-            config={
-                "search_domain_filter": ["example.com"],
-                "search_recency_filter": "week",
-                "search_context_size": "high",
-            },
+    @pytest.mark.asyncio
+    async def test_mount_with_api_key_env(self, monkeypatch) -> None:
+        """Mount should work with API key from environment."""
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key-from-env")
+
+        from amplifier_module_provider_perplexity import mount
+        from amplifier_core import TestCoordinator
+
+        coordinator = TestCoordinator()
+        cleanup = await mount(coordinator, {})
+
+        assert cleanup is not None
+        # Verify provider was mounted
+        assert any(
+            entry.get("name") == "perplexity"
+            for entry in coordinator.mount_history
+            if entry.get("mount_point") == "providers"
         )
 
-    def test_build_basic_request(self) -> None:
-        """Basic request should include required parameters."""
+        # Cleanup
+        await cleanup()
 
-        class MockRequest:
-            model = "sonar"
-            max_tokens = 1000
-            temperature = 0.5
-            messages = []
+    @pytest.mark.asyncio
+    async def test_mount_without_api_key_returns_none(self, monkeypatch) -> None:
+        """Mount should return None if no API key available."""
+        monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
 
-        messages = [{"role": "user", "content": "Hello"}]
-        params = self.provider._build_request_params(MockRequest(), None, messages)
+        from amplifier_module_provider_perplexity import mount
+        from amplifier_core import TestCoordinator
 
-        assert params["model"] == "sonar"
-        assert params["max_tokens"] == 1000
-        assert params["temperature"] == 0.5
-        assert params["messages"] == messages
+        coordinator = TestCoordinator()
+        result = await mount(coordinator, {})
 
-    def test_build_request_with_system_prompt(self) -> None:
-        """Request with system prompt should include it."""
-
-        class MockRequest:
-            model = "sonar"
-            max_tokens = 1000
-            temperature = 0.5
-            messages = []
-
-        messages = [{"role": "user", "content": "Hello"}]
-        params = self.provider._build_request_params(
-            MockRequest(), "Be helpful.", messages
-        )
-
-        assert params["system"] == "Be helpful."
-
-    def test_build_request_with_search_options(self) -> None:
-        """Request should include web search options from config."""
-
-        class MockRequest:
-            model = "sonar"
-            max_tokens = 1000
-            temperature = 0.5
-            messages = []
-
-        messages = [{"role": "user", "content": "Hello"}]
-        params = self.provider._build_request_params(MockRequest(), None, messages)
-
-        assert "web_search_options" in params
-        assert params["web_search_options"]["search_domain_filter"] == ["example.com"]
-        assert params["web_search_options"]["search_recency_filter"] == "week"
-        assert params["web_search_options"]["search_context_size"] == "high"
+        assert result is None
