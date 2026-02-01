@@ -4,17 +4,41 @@ Perplexity AI provider for Amplifier, enabling web-grounded AI search with real-
 
 ## Installation
 
-```bash
-# Using uv
-uv add amplifier-module-provider-perplexity
+### Option 1: Amplifier CLI (Recommended)
 
-# Using pip
-pip install amplifier-module-provider-perplexity
+```bash
+# Install the provider module
+amplifier provider install perplexity --source git+https://github.com/colombod/amplifier-module-provider-perplexity@main
+
+# Verify installation
+amplifier provider list
 ```
 
-## Configuration
+### Option 2: In Your Bundle
 
-### Environment Variables
+Add to your bundle's providers section:
+
+```yaml
+providers:
+  - module: provider-perplexity
+    source: git+https://github.com/colombod/amplifier-module-provider-perplexity@main
+    config:
+      default_model: sonar-pro
+```
+
+### Option 3: settings.yaml Override
+
+Add to `~/.amplifier/settings.yaml`:
+
+```yaml
+modules:
+  provider-perplexity:
+    source: git+https://github.com/colombod/amplifier-module-provider-perplexity@main
+    config:
+      default_model: sonar-pro
+```
+
+## Environment Setup
 
 Set your Perplexity API key:
 
@@ -22,33 +46,50 @@ Set your Perplexity API key:
 export PERPLEXITY_API_KEY="pplx-xxxxxxxxxxxxxxxx"
 ```
 
-### settings.yaml
+Or add to your shell profile (`~/.bashrc`, `~/.zshrc`):
 
-Add the provider to your Amplifier configuration:
+```bash
+echo 'export PERPLEXITY_API_KEY="pplx-xxxxxxxxxxxxxxxx"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+## Quick Start
+
+After installation, start Amplifier and it will use Perplexity as a provider:
+
+```bash
+# Interactive session
+amplifier
+
+# Or single query
+amplifier run "What are the latest developments in quantum computing?"
+```
+
+## Configuration Options
+
+Full configuration reference for `settings.yaml` or bundle config:
 
 ```yaml
-modules:
-  - name: provider-perplexity
-    config:
-      # Optional: Override default model
-      default_model: sonar-pro
-      
-      # Optional: Search settings
-      search_recency_filter: week  # none, hour, day, week, month, year
-      search_context_size: medium  # low, medium, high
-      search_domain_filter:
-        - example.com
-        - docs.example.com
-      
-      # Optional: Additional response data
-      return_images: false
-      return_related_questions: false
-      
-      # Optional: Request settings
-      max_tokens: 4096
-      temperature: 0.7
-      timeout: 60.0
-      max_retries: 3
+config:
+  # Model selection
+  default_model: sonar-pro  # sonar, sonar-pro, sonar-reasoning, etc.
+  
+  # Search settings
+  search_recency_filter: week  # none, hour, day, week, month, year
+  search_context_size: medium  # low, medium, high
+  search_domain_filter:        # Restrict to specific domains
+    - example.com
+    - docs.example.com
+  
+  # Response options
+  return_images: false
+  return_related_questions: false
+  
+  # Request settings
+  max_tokens: 4096
+  temperature: 0.7
+  timeout: 60.0
+  max_retries: 3
 ```
 
 ## Available Models
@@ -156,6 +197,10 @@ The provider implements automatic retry with exponential backoff for:
 Errors that are not retried:
 
 - **401 (Unauthorized)**: Invalid API key - fails immediately
+
+## Related
+
+- **amplifier-bundle-perplexity**: Deep research bundle using Perplexity's Agentic Research API (for multi-step research with categorized references)
 
 ## License
 
