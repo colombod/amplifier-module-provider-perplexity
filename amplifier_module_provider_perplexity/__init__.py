@@ -119,11 +119,7 @@ class PerplexityProvider:
                 raise ValueError("api_key must be provided for API calls")
             self._client = AsyncPerplexity(
                 api_key=self._api_key,
-                timeout=(
-                    self.timeout
-                    if self.timeout is not None
-                    else perplexity.Timeout(None, connect=5.0, pool=5.0)
-                ),
+                timeout=perplexity.Timeout(self.timeout, connect=5.0, pool=5.0),
                 max_retries=self.max_retries,
             )
         return self._client
@@ -348,6 +344,13 @@ class PerplexityProvider:
                 if self.raw:
                     event["raw"] = redact_secrets(params)
                 await self.coordinator.hooks.emit("llm:request", event)
+            if "timeout" in params:
+                # None means no generation deadline, not unbounded connection
+                # acquisition. Keep the same bounds as the configured client.
+                # Normalize after raw capture so events retain JSON-safe values.
+                params["timeout"] = perplexity.Timeout(
+                    params["timeout"], connect=5.0, pool=5.0
+                )
             response = await self.client.chat.completions.create(**params)
 
             # Convert SDK response to ChatResponse

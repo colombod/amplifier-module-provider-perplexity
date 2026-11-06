@@ -231,9 +231,15 @@ MIT
 ### Completion waits
 
 Healthy model requests have no default read/elapsed deadline. Explicit `timeout`
-configuration remains supported; connection and pool acquisition stay bounded.
+configuration remains supported. A scalar timeout sets the SDK read/write waits;
+`None` leaves those waits unlimited. Both forms keep connection and pool
+acquisition bounded at five seconds, including per-call overrides.
 Cancellation propagates. Slow generation is not evidence of a broken service.
 Per-call options can be supplied in `request_options`; explicit keyword arguments
-take precedence over that mapping.
+take precedence over that mapping, which overrides provider configuration.
+For example, `complete(request, timeout=None)` removes a configured read/write
+timeout without removing the connection/pool bounds. Omitting the per-call option
+uses the configured timeout. These are transport phase timeouts, not a total
+elapsed request deadline.
 
 `raw: true` enables full redacted request capture on the standard `llm:request` event. It defaults to false.
