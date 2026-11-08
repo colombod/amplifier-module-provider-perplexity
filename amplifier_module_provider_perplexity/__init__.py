@@ -16,14 +16,12 @@ Example:
 import logging
 import os
 from collections.abc import Mapping
-from typing import Any
+from operator import attrgetter
+from types import TracebackType
+from typing import Any, Literal, NotRequired, Self, TypedDict, cast
 
 import perplexity
-from perplexity import AsyncPerplexity
-from ._model_listing import ModelFilters, selector_schema
-
 from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
-from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -32,10 +30,30 @@ from amplifier_core.message_models import (
     ToolCall,
     Usage,
 )
+from amplifier_core.utils import redact_secrets
+from perplexity import AsyncPerplexity
+from perplexity.types.shared_params.chat_message_input import ChatMessageInput
+from perplexity.types.shared_params.web_search_options import WebSearchOptions
+
+from ._model_listing import ModelFilters, selector_schema
 
 __all__ = ["PerplexityProvider", "mount"]
 
 logger = logging.getLogger(__name__)
+
+
+class _WebSearchOptions(WebSearchOptions, total=False):
+    search_domain_filter: list[str]
+    search_recency_filter: str
+
+
+class _CompletionParams(TypedDict):
+    model: str
+    messages: list[ChatMessageInput]
+    max_tokens: int
+    temperature: float | None
+    web_search_options: WebSearchOptions
+    timeout: NotRequired[float | perplexity.Timeout | None]
 
 
 class PerplexityProvider:
@@ -70,19 +88,29 @@ class PerplexityProvider:
         self._client: AsyncPerplexity | None = None
         self.config = config or {}
         self.coordinator = coordinator
-        self._model_filters = ModelFilters.parse(self.config.get("model_filters", {
-            "include": ["sonar", "sonar-pro", "sonar-reasoning-pro", "sonar-deep-research"],
-        }))
+        self._model_filters = ModelFilters.parse(
+            self.config.get(
+                "model_filters",
+                {
+                    "include": [
+                        "sonar",
+                        "sonar-pro",
+                        "sonar-reasoning-pro",
+                        "sonar-deep-research",
+                    ],
+                },
+            )
+        )
 
         # Model and generation settings
         self.default_model: str = self.config.get("default_model", "sonar")
         self.max_tokens: int = self.config.get("max_tokens", 4096)
-        self.temperature: float = self.config.get("temperature", 0.7)
+        self.temperature: float | None = self.config.get("temperature", 0.7)
 
         # HTTP settings (passed to SDK)
         # Healthy generation is cancellable but has no implicit read deadline.
         # Slow responses must not be mistaken for a broken service.
-        self.timeout: float | None = self.config.get("timeout")
+        self.timeout: float | perplexity.Timeout | None = self.config.get("timeout")
         self.max_retries: int = self.config.get("max_retries", 2)
 
         # Perplexity-specific search settings
@@ -92,7 +120,9 @@ class PerplexityProvider:
         self.search_domain_filter: list[str] | None = self.config.get(
             "search_domain_filter"
         )
-        self.search_context_size: str = self.config.get("search_context_size", "medium")
+        self.search_context_size: Literal["low", "medium", "high"] = self.config.get(
+            "search_context_size", "medium"
+        )
         self.return_images: bool = self.config.get("return_images", False)
         self.return_related_questions: bool = self.config.get(
             "return_related_questions", False
@@ -121,8 +151,8 @@ class PerplexityProvider:
                 api_key=self._api_key,
                 timeout=(
                     self.timeout
-                    if self.timeout is not None
-                    else perplexity.Timeout(None, connect=5.0, pool=5.0)
+                    if isinstance(self.timeout, perplexity.Timeout)
+                    else perplexity.Timeout(self.timeout, connect=5.0, pool=5.0)
                 ),
                 max_retries=self.max_retries,
             )
@@ -138,11 +168,16 @@ class PerplexityProvider:
             await self._client.close()
             self._client = None
 
-    async def __aenter__(self) -> "PerplexityProvider":
+    async def __aenter__(self) -> Self:
         """Async context manager entry."""
         return self
 
-    async def __aexit__(self, *args: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Async context manager exit - ensures client cleanup."""
         await self.close()
 
@@ -277,8 +312,6 @@ class PerplexityProvider:
         """
         request_options = kwargs.pop("request_options", None)
         if request_options is not None:
-            from collections.abc import Mapping
-
             if not isinstance(request_options, Mapping):
                 raise ValueError("request_options must be a mapping or None")
             kwargs = {**request_options, **kwargs}
@@ -287,11 +320,11 @@ class PerplexityProvider:
         system_prompt, messages = self._convert_messages(request.messages)
 
         # Build request parameters
-        model = kwargs.get("model") or request.model or self.default_model
-        max_tokens = (
+        model: str = kwargs.get("model") or request.model or self.default_model
+        max_tokens: int = (
             kwargs.get("max_tokens") or request.max_output_tokens or self.max_tokens
         )
-        temperature = (
+        temperature: float | None = (
             kwargs.get("temperature")
             if kwargs.get("temperature") is not None
             else (
@@ -302,7 +335,7 @@ class PerplexityProvider:
         )
 
         # Build web search options
-        web_search_options: dict[str, Any] = {}
+        web_search_options: _WebSearchOptions = {}
 
         if self.search_domain_filter:
             web_search_options["search_domain_filter"] = self.search_domain_filter
@@ -313,7 +346,9 @@ class PerplexityProvider:
         if search_recency and search_recency != "none":
             web_search_options["search_recency_filter"] = search_recency
 
-        search_context = kwargs.get("search_context_size") or self.search_context_size
+        search_context: Literal["low", "medium", "high"] = (
+            kwargs.get("search_context_size") or self.search_context_size
+        )
         if search_context:
             web_search_options["search_context_size"] = search_context
 
@@ -325,29 +360,45 @@ class PerplexityProvider:
                 )
 
             # Prepare messages for SDK (add system message if present)
-            sdk_messages: list[dict[str, str]] = []
+            sdk_messages: list[ChatMessageInput] = []
             if system_prompt:
                 sdk_messages.append({"role": "system", "content": system_prompt})
             sdk_messages.extend(messages)
 
-            params = dict(
-                model=model,
-                messages=sdk_messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                web_search_options=web_search_options if web_search_options else None,
-            )
+            params: _CompletionParams = {
+                "model": model,
+                "messages": sdk_messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                # The generated request accepts null despite the SDK annotation.
+                "web_search_options": cast(
+                    WebSearchOptions, web_search_options if web_search_options else None
+                ),
+            }
             if "timeout" in kwargs:
                 params["timeout"] = kwargs["timeout"]
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                event = {
+                event: dict[str, object] = {
                     "provider": self.name,
                     "model": model,
                     "messages_count": len(sdk_messages),
                 }
                 if self.raw:
-                    event["raw"] = redact_secrets(params)
+                    raw_params: dict[str, object] = dict(params)
+                    raw_timeout = raw_params.get("timeout")
+                    if isinstance(raw_timeout, perplexity.Timeout):
+                        raw_params["timeout"] = raw_timeout.as_dict()
+                    event["raw"] = redact_secrets(raw_params)
                 await self.coordinator.hooks.emit("llm:request", event)
+            if "timeout" in params:
+                timeout: float | perplexity.Timeout | None = params["timeout"]
+                if not isinstance(timeout, perplexity.Timeout):
+                    # None means no generation deadline, not unbounded connection
+                    # acquisition. Keep the same bounds as the configured client.
+                    # Normalize after raw capture so events retain JSON-safe values.
+                    params["timeout"] = perplexity.Timeout(
+                        timeout, connect=5.0, pool=5.0
+                    )
             response = await self.client.chat.completions.create(**params)
 
             # Convert SDK response to ChatResponse
@@ -399,7 +450,7 @@ class PerplexityProvider:
 
     def _convert_messages(
         self, messages: list[Message]
-    ) -> tuple[str | None, list[dict[str, str]]]:
+    ) -> tuple[str | None, list[ChatMessageInput]]:
         """Convert Amplifier messages to Perplexity format.
 
         Handles system, developer, user, assistant, and tool roles:
@@ -415,7 +466,7 @@ class PerplexityProvider:
             Tuple of (system_prompt, conversation_messages).
         """
         system_parts: list[str] = []
-        conversation: list[dict[str, str]] = []
+        conversation: list[ChatMessageInput] = []
 
         for msg in messages:
             role = msg.role
@@ -442,10 +493,9 @@ class PerplexityProvider:
                 if text:
                     conversation.append({"role": "assistant", "content": text})
 
-            elif role == "tool":
+            elif role == "tool" and self.debug:
                 # Tool messages not supported, skip
-                if self.debug:
-                    logger.debug("Skipping tool message (not supported by Perplexity)")
+                logger.debug("Skipping tool message (not supported by Perplexity)")
 
         system_prompt = "\n\n".join(system_parts) if system_parts else None
         return system_prompt, conversation
@@ -470,7 +520,7 @@ class PerplexityProvider:
             elif isinstance(block, dict) and block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
             elif hasattr(block, "text"):
-                text_parts.append(getattr(block, "text"))
+                text_parts.append(attrgetter("text")(block))
 
         return "\n".join(text_parts)
 

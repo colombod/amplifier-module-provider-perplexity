@@ -192,7 +192,10 @@ from amplifier_core.message_models import ChatRequest, Message
 request = ChatRequest(
     model="sonar",
     messages=[
-        Message(role="user", content="What are the latest developments in quantum computing?")
+        Message(
+            role="user",
+            content="What are the latest developments in quantum computing?",
+        )
     ],
     max_output_tokens=2000,
 )
@@ -230,10 +233,24 @@ MIT
 
 ### Completion waits
 
-Healthy model requests have no default read/elapsed deadline. Explicit `timeout`
-configuration remains supported; connection and pool acquisition stay bounded.
-Cancellation propagates. Slow generation is not evidence of a broken service.
-Per-call options can be supplied in `request_options`; explicit keyword arguments
-take precedence over that mapping.
+Healthy model requests have no default generation read/write or total elapsed
+deadline. A scalar `timeout` sets the SDK read/write waits to that value, including
+zero; `None` leaves those waits unlimited. Both forms keep connection and pool
+acquisition bounded at five seconds, including per-call overrides.
 
-`raw: true` enables full redacted request capture on the standard `llm:request` event. It defaults to false.
+A structured `perplexity.Timeout` can be supplied through provider configuration,
+a direct `timeout` keyword, or `request_options`. It preserves all four explicit
+phases (`connect`, `read`, `write`, and `pool`), including `None` and zero. The
+five-second connection/pool bounds are **not** imposed on structured timeouts.
+
+Explicit keyword arguments take precedence over `request_options`, which
+overrides provider configuration. Omitting the per-call timeout inherits the
+configured timeout. For example, `complete(request, timeout=None)` removes a
+configured read/write timeout while keeping connection/pool bounds at five
+seconds. These are transport phase timeouts, not a total elapsed request deadline.
+Cancellation propagates. Slow generation is not evidence of a broken service.
+
+`raw: true` enables full redacted request capture on the standard `llm:request`
+event. It defaults to false. Explicit structured timeouts are captured as
+JSON-safe phase dictionaries; scalar and `None` timeout values remain unchanged.
+An inherited configured timeout is not added to the raw per-call parameters.

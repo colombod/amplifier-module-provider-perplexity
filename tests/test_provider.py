@@ -11,6 +11,8 @@ Tests cover:
 from unittest.mock import MagicMock
 
 import pytest
+from amplifier_core import MockCoordinator
+from amplifier_core.message_models import ChatResponse, Message, TextBlock
 
 from amplifier_module_provider_perplexity import PerplexityProvider
 
@@ -25,11 +27,7 @@ class TestMessageConversion:
     def test_convert_system_message(self) -> None:
         """System messages should be extracted into system prompt."""
 
-        class MockMessage:
-            role = "system"
-            content = "You are a helpful assistant."
-
-        messages = [MockMessage()]
+        messages = [Message(role="system", content="You are a helpful assistant.")]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt == "You are a helpful assistant."
@@ -38,15 +36,10 @@ class TestMessageConversion:
     def test_convert_multiple_system_messages(self) -> None:
         """Multiple system messages should be combined."""
 
-        class MockMessage1:
-            role = "system"
-            content = "You are helpful."
-
-        class MockMessage2:
-            role = "system"
-            content = "Be concise."
-
-        messages = [MockMessage1(), MockMessage2()]
+        messages = [
+            Message(role="system", content="You are helpful."),
+            Message(role="system", content="Be concise."),
+        ]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt == "You are helpful.\n\nBe concise."
@@ -55,11 +48,7 @@ class TestMessageConversion:
     def test_convert_user_message(self) -> None:
         """User messages should pass through directly."""
 
-        class MockMessage:
-            role = "user"
-            content = "Hello, how are you?"
-
-        messages = [MockMessage()]
+        messages = [Message(role="user", content="Hello, how are you?")]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt is None
@@ -69,11 +58,7 @@ class TestMessageConversion:
     def test_convert_assistant_message(self) -> None:
         """Assistant messages should pass through directly."""
 
-        class MockMessage:
-            role = "assistant"
-            content = "I'm doing well, thank you!"
-
-        messages = [MockMessage()]
+        messages = [Message(role="assistant", content="I'm doing well, thank you!")]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt is None
@@ -86,28 +71,22 @@ class TestMessageConversion:
     def test_convert_developer_message(self) -> None:
         """Developer messages should be wrapped in context_file tags."""
 
-        class MockMessage:
-            role = "developer"
-            content = "This is context information."
-
-        messages = [MockMessage()]
+        messages = [Message(role="developer", content="This is context information.")]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt is None
         assert len(conversation) == 1
         assert conversation[0]["role"] == "user"
-        assert "<context_file>" in conversation[0]["content"]
-        assert "This is context information." in conversation[0]["content"]
-        assert "</context_file>" in conversation[0]["content"]
+        content = conversation[0]["content"]
+        assert isinstance(content, str)
+        assert "<context_file>" in content
+        assert "This is context information." in content
+        assert "</context_file>" in content
 
     def test_convert_tool_message_skipped(self) -> None:
         """Tool messages should be skipped (not supported by Perplexity)."""
 
-        class MockMessage:
-            role = "tool"
-            content = "Tool result"
-
-        messages = [MockMessage()]
+        messages = [Message(role="tool", content="Tool result")]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt is None
@@ -116,23 +95,12 @@ class TestMessageConversion:
     def test_convert_mixed_messages(self) -> None:
         """Mixed message types should be handled correctly."""
 
-        class SystemMsg:
-            role = "system"
-            content = "Be helpful."
-
-        class UserMsg:
-            role = "user"
-            content = "Hello"
-
-        class AssistantMsg:
-            role = "assistant"
-            content = "Hi there!"
-
-        class UserMsg2:
-            role = "user"
-            content = "How are you?"
-
-        messages = [SystemMsg(), UserMsg(), AssistantMsg(), UserMsg2()]
+        messages = [
+            Message(role="system", content="Be helpful."),
+            Message(role="user", content="Hello"),
+            Message(role="assistant", content="Hi there!"),
+            Message(role="user", content="How are you?"),
+        ]
         system_prompt, conversation = self.provider._convert_messages(messages)
 
         assert system_prompt == "Be helpful."
@@ -163,9 +131,24 @@ class TestTextExtraction:
         result = self.provider._extract_text_content(content)
         assert result == "Hello\nWorld"
 
+        class TextDict(dict[str, str]):
+            text = "Attribute text"
+
+        assert (
+            self.provider._extract_text_content(
+                [TextDict(type="other", text="Mapping text")]
+            )
+            == "Attribute text"
+        )
+        assert (
+            self.provider._extract_text_content(
+                [TextDict(type="text", text="Mapping text")]
+            )
+            == "Mapping text"
+        )
+
     def test_extract_textblock_objects(self) -> None:
         """TextBlock objects should be extracted."""
-        from amplifier_core.message_models import TextBlock
 
         content = [
             TextBlock(type="text", text="Hello"),
@@ -230,8 +213,12 @@ class TestSDKResponseConversion:
 
         response = self.provider._convert_sdk_response(mock_response, "sonar")
 
+        assert response.metadata is not None
         assert response.metadata["perplexity:model"] == "sonar"
-        assert "The capital of France is Paris." in response.content[0].text
+        block = response.content[0]
+        assert isinstance(block, TextBlock)
+        assert "The capital of France is Paris." in block.text
+        assert response.usage is not None
         assert response.usage.input_tokens == 10
         assert response.usage.output_tokens == 20
 
@@ -244,10 +231,12 @@ class TestSDKResponseConversion:
 
         response = self.provider._convert_sdk_response(mock_response, "sonar")
 
-        assert "Paris is the capital." in response.content[0].text
-        assert "Sources:" in response.content[0].text
-        assert "https://example.com/paris" in response.content[0].text
-        assert "https://wiki.org/france" in response.content[0].text
+        block = response.content[0]
+        assert isinstance(block, TextBlock)
+        assert "Paris is the capital." in block.text
+        assert "Sources:" in block.text
+        assert "https://example.com/paris" in block.text
+        assert "https://wiki.org/france" in block.text
 
     def test_convert_response_stop_reason_length(self) -> None:
         """Length finish reason should map to max_tokens."""
@@ -276,7 +265,9 @@ class TestSDKResponseConversion:
 
         response = self.provider._convert_sdk_response(mock_response, "sonar")
 
-        assert response.content[0].text == ""
+        block = response.content[0]
+        assert isinstance(block, TextBlock)
+        assert block.text == ""
 
 
 class TestProviderInfo:
@@ -376,10 +367,7 @@ class TestToolCalls:
     def test_parse_tool_calls_returns_empty_list(self) -> None:
         """parse_tool_calls() should always return empty list."""
 
-        class MockResponse:
-            content = []
-
-        result = self.provider.parse_tool_calls(MockResponse())
+        result = self.provider.parse_tool_calls(ChatResponse(content=[]))
         assert result == []
 
 
@@ -397,19 +385,27 @@ class TestClientLifecycle:
         with pytest.raises(ValueError, match="api_key must be provided"):
             _ = provider.client
 
-    def test_client_lazy_initialization(self) -> None:
+    @pytest.mark.asyncio
+    async def test_client_lazy_initialization(self) -> None:
         """Client should be initialized on first access."""
         provider = PerplexityProvider(api_key="test-key")
-        client = provider.client
-        assert client is not None
-        assert provider._client is not None
+        try:
+            client = provider.client
+            assert client is not None
+            assert provider._client is not None
+        finally:
+            await provider.close()
 
-    def test_client_reused_on_subsequent_access(self) -> None:
+    @pytest.mark.asyncio
+    async def test_client_reused_on_subsequent_access(self) -> None:
         """Same client instance should be returned on subsequent access."""
         provider = PerplexityProvider(api_key="test-key")
-        client1 = provider.client
-        client2 = provider.client
-        assert client1 is client2
+        try:
+            client1 = provider.client
+            client2 = provider.client
+            assert client1 is client2
+        finally:
+            await provider.close()
 
     @pytest.mark.asyncio
     async def test_close_method(self) -> None:
@@ -475,22 +471,18 @@ class TestMount:
         monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key-from-env")
 
         from amplifier_module_provider_perplexity import mount
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock
 
-        coordinator = SimpleNamespace(
-            mount=AsyncMock(), hooks=SimpleNamespace(emit=AsyncMock())
-        )
+        coordinator = MockCoordinator()
         cleanup = await mount(coordinator, {})
 
         assert cleanup is not None
-        # Verify provider was mounted
-        coordinator.mount.assert_awaited_once()
-        assert coordinator.mount.call_args.args[0] == "providers"
-        assert coordinator.mount.call_args.kwargs["name"] == "perplexity"
-
-        # Cleanup
-        await cleanup()
+        try:
+            # Verify provider was mounted
+            assert len(coordinator.mount_history) == 1
+            assert coordinator.mount_history[0]["mount_point"] == "providers"
+            assert coordinator.mount_history[0]["name"] == "perplexity"
+        finally:
+            await cleanup()
 
     @pytest.mark.asyncio
     async def test_mount_without_api_key_returns_none(self, monkeypatch) -> None:
@@ -498,12 +490,9 @@ class TestMount:
         monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
 
         from amplifier_module_provider_perplexity import mount
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock
 
-        coordinator = SimpleNamespace(
-            mount=AsyncMock(), hooks=SimpleNamespace(emit=AsyncMock())
-        )
+        coordinator = MockCoordinator()
         result = await mount(coordinator, {})
 
         assert result is None
+        assert coordinator.mount_history == []

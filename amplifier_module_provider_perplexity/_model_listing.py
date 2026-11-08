@@ -26,7 +26,9 @@ class ModelFilters:
             if not isinstance(raw, (list, tuple)) or any(
                 not isinstance(pattern, str) or not pattern.strip() for pattern in raw
             ):
-                raise ValueError(f"model filters {key} must be a list of nonblank strings")
+                raise ValueError(
+                    f"model filters {key} must be a list of nonblank strings"
+                )
             return tuple(raw)
 
         hide_dated = value.get("hide_dated", False)
@@ -36,34 +38,58 @@ class ModelFilters:
 
     def select(self, ids: list[str]) -> list[str]:
         selected = {
-            model_id for model_id in ids
-            if any(fnmatchcase(model_id.casefold(), pattern.casefold()) for pattern in self.include)
-            and not any(fnmatchcase(model_id.casefold(), pattern.casefold()) for pattern in self.exclude)
+            model_id
+            for model_id in ids
+            if any(
+                fnmatchcase(model_id.casefold(), pattern.casefold())
+                for pattern in self.include
+            )
+            and not any(
+                fnmatchcase(model_id.casefold(), pattern.casefold())
+                for pattern in self.exclude
+            )
         }
         if self.hide_dated:
             selected = {
-                model_id for model_id in selected
+                model_id
+                for model_id in selected
                 if not (
                     (match := re.search(r"-\d{4}-\d{2}-\d{2}$", model_id))
-                    and model_id[:match.start()] in selected
+                    and model_id[: match.start()] in selected
                 )
             }
         return sorted(selected)
 
     def as_dict(self) -> dict:
-        return {"include": list(self.include), "exclude": list(self.exclude), "hide_dated": self.hide_dated}
+        return {
+            "include": list(self.include),
+            "exclude": list(self.exclude),
+            "hide_dated": self.hide_dated,
+        }
 
 
 def selector_schema() -> dict:
     """Return a fresh schema so capability inspection cannot change policy."""
     return {
-        "type": "object", "additionalProperties": False,
+        "type": "object",
+        "additionalProperties": False,
         "properties": {
-            "include": {"type": "array", "items": {"type": "string", "minLength": 1},
-                        "default": ["*"], "description": "Case-insensitive OS-independent globs; [] includes none."},
-            "exclude": {"type": "array", "items": {"type": "string", "minLength": 1},
-                        "default": [], "description": "Case-insensitive OS-independent globs; exclusion wins."},
-            "hide_dated": {"type": "boolean", "default": False,
-                           "description": "Hide YYYY-MM-DD suffixes only when a selected undated alias exists."},
+            "include": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "default": ["*"],
+                "description": "Case-insensitive OS-independent globs; [] includes none.",
+            },
+            "exclude": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "default": [],
+                "description": "Case-insensitive OS-independent globs; exclusion wins.",
+            },
+            "hide_dated": {
+                "type": "boolean",
+                "default": False,
+                "description": "Hide YYYY-MM-DD suffixes only when a selected undated alias exists.",
+            },
         },
     }
