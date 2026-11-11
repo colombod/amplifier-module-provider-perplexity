@@ -17,6 +17,7 @@ import perplexity
 import pytest
 from amplifier_core import MockCoordinator, ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message, TextBlock
+from perplexity.generated.api import ResponseCreateResponse
 
 import amplifier_module_provider_perplexity as module
 
@@ -60,22 +61,26 @@ def completion_request() -> ChatRequest:
 
 
 def response() -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "id": "fixture",
-            "model": "r1-1776",
-            "created": 1,
-            "choices": [
-                {
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "ok"},
-                }
-            ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        },
-    )
+    payload = {
+        "id": "fixture",
+        "object": "response",
+        "created_at": 1,
+        "model": "r1-1776",
+        "status": "completed",
+        "error": None,
+        "output": [
+            {
+                "id": "fixture-message",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+            }
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+    ResponseCreateResponse.model_validate(payload, strict=True)
+    return httpx.Response(200, json=payload)
 
 
 def expected_timeout(value):
@@ -138,8 +143,9 @@ async def test_transport_timeout_preserves_connect_and_pool(
         assert isinstance(block, TextBlock)
         assert block.text == "ok"
         assert len(seen) == 1
+        assert seen[0].method == "POST" and seen[0].url.path == "/v1/responses"
         body = json.loads(seen[0].content)
-        assert body["model"] == "r1-1776" and body["max_tokens"] == 17
+        assert body["model"] == "r1-1776" and body["max_output_tokens"] == 17
         assert body["temperature"] == 0.25
         assert "timeout" not in body and "request_options" not in body
         assert seen[0].headers["authorization"] == "Bearer fixture-only"

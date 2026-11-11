@@ -1,40 +1,19 @@
-"""
-Perplexity AI Provider for Amplifier.
-
-A provider module that integrates Perplexity's web-grounded AI search
-capabilities into Amplifier, featuring real-time web search, citations,
-and multiple specialized models.
-
-Uses the official Perplexity Python SDK for robust API interaction.
-
-Example:
-    >>> from amplifier_module_provider_perplexity import PerplexityProvider
-    >>> provider = PerplexityProvider(api_key="pplx-xxx")
-    >>> response = await provider.complete(request)
-"""
+"""Buffered native Perplexity Agent Responses provider for Amplifier."""
 
 import logging
 import os
 from collections.abc import Mapping
-from operator import attrgetter
+from copy import deepcopy
 from types import TracebackType
-from typing import Any, Literal, NotRequired, Self, TypedDict, cast
+from typing import Any, Self
 
 import perplexity
 from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
-from amplifier_core.message_models import (
-    ChatRequest,
-    ChatResponse,
-    Message,
-    TextBlock,
-    ToolCall,
-    Usage,
-)
+from amplifier_core.message_models import ChatRequest, ChatResponse, ToolCall
 from amplifier_core.utils import redact_secrets
 from perplexity import AsyncPerplexity
-from perplexity.types.shared_params.chat_message_input import ChatMessageInput
-from perplexity.types.shared_params.web_search_options import WebSearchOptions
 
+from ._agent_api import build_agent_request, convert_agent_response, request_body
 from ._model_listing import ModelFilters, selector_schema
 
 __all__ = ["PerplexityProvider", "mount"]
@@ -42,31 +21,8 @@ __all__ = ["PerplexityProvider", "mount"]
 logger = logging.getLogger(__name__)
 
 
-class _WebSearchOptions(WebSearchOptions, total=False):
-    search_domain_filter: list[str]
-    search_recency_filter: str
-
-
-class _CompletionParams(TypedDict):
-    model: str
-    messages: list[ChatMessageInput]
-    max_tokens: int
-    temperature: float | None
-    web_search_options: WebSearchOptions
-    timeout: NotRequired[float | perplexity.Timeout | None]
-
-
 class PerplexityProvider:
-    """Perplexity AI provider with web-grounded search capabilities.
-
-    This provider integrates with Perplexity's API using the official SDK
-    to provide AI responses grounded in real-time web search results,
-    complete with citations.
-
-    Attributes:
-        name: Provider identifier ("perplexity")
-        api_label: Human-readable label ("Perplexity")
-    """
+    """Native Agent adapter; vendor search tools are not client tool calls."""
 
     name = "perplexity"
     api_label = "Perplexity"
@@ -77,12 +33,10 @@ class PerplexityProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
     ) -> None:
-        """Initialize the Perplexity provider.
+        """Configure without creating a client; direct inference needs a key.
 
-        Args:
-            api_key: Perplexity API key. Falls back to PERPLEXITY_API_KEY env var.
-            config: Provider configuration options.
-            coordinator: Module coordinator for event emission.
+        mount() alone resolves environment credentials. Listing is static and
+        does not imply account entitlement, capacity, or pricing guarantees.
         """
         self._api_key = api_key
         self._client: AsyncPerplexity | None = None
@@ -91,59 +45,38 @@ class PerplexityProvider:
         self._model_filters = ModelFilters.parse(
             self.config.get(
                 "model_filters",
-                {
-                    "include": [
-                        "sonar",
-                        "sonar-pro",
-                        "sonar-reasoning-pro",
-                        "sonar-deep-research",
-                    ],
-                },
+                {"include": ["agent-fast", "agent-low", "agent-medium", "agent-high"]},
             )
         )
-
-        # Model and generation settings
-        self.default_model: str = self.config.get("default_model", "sonar")
+        self.default_model: str = self.config.get("default_model", "agent-fast")
         self.max_tokens: int = self.config.get("max_tokens", 4096)
-        self.temperature: float | None = self.config.get("temperature", 0.7)
-
-        # HTTP settings (passed to SDK)
-        # Healthy generation is cancellable but has no implicit read deadline.
-        # Slow responses must not be mistaken for a broken service.
-        self.timeout: float | perplexity.Timeout | None = self.config.get("timeout")
-        self.max_retries: int = self.config.get("max_retries", 2)
-
-        # Perplexity-specific search settings
+        self.max_steps: int = self.config.get("max_steps", 1)
+        self.temperature: float | None = self.config.get("temperature")
+        # Retain constructor-facing attributes; helper owns request validation.
         self.search_recency_filter: str | None = self.config.get(
             "search_recency_filter"
         )
         self.search_domain_filter: list[str] | None = self.config.get(
             "search_domain_filter"
         )
-        self.search_context_size: Literal["low", "medium", "high"] = self.config.get(
-            "search_context_size", "medium"
-        )
+        self.search_context_size: str | None = self.config.get("search_context_size")
         self.return_images: bool = self.config.get("return_images", False)
         self.return_related_questions: bool = self.config.get(
             "return_related_questions", False
         )
-
-        # Debug mode
+        # Healthy generation has no implicit read/write deadline.
+        self.timeout: float | perplexity.Timeout | None = self.config.get("timeout")
+        self.max_retries: int = self.config.get("max_retries", 2)
         self.debug: bool = self.config.get("debug", False)
         self.raw: bool = self.config.get("raw", False)
+        if type(self.debug) is not bool:
+            raise ValueError("debug must be a boolean")
         if type(self.raw) is not bool:
             raise ValueError("raw must be a boolean")
 
     @property
     def client(self) -> AsyncPerplexity:
-        """Lazily initialize the Perplexity SDK client.
-
-        Returns:
-            Configured AsyncPerplexity client for API calls.
-
-        Raises:
-            ValueError: If api_key is not provided.
-        """
+        """Lazily create and reuse the SDK client, preserving phase timeouts."""
         if self._client is None:
             if self._api_key is None:
                 raise ValueError("api_key must be provided for API calls")
@@ -159,17 +92,13 @@ class PerplexityProvider:
         return self._client
 
     async def close(self) -> None:
-        """Close the SDK client if initialized.
-
-        Call this method when done using the provider directly.
-        When using via mount(), cleanup is handled automatically.
-        """
+        """Close the cached client; mounted use receives a cleanup callback."""
         if self._client is not None:
             await self._client.close()
             self._client = None
 
     async def __aenter__(self) -> Self:
-        """Async context manager entry."""
+        """Return this provider for direct async-context-managed use."""
         return self
 
     async def __aexit__(
@@ -178,20 +107,23 @@ class PerplexityProvider:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Async context manager exit - ensures client cleanup."""
+        """Close resources on context exit, without suppressing exceptions."""
         await self.close()
 
     def get_info(self) -> ProviderInfo:
-        """Get provider metadata and configuration schema.
-
-        Returns:
-            ProviderInfo containing provider details and config fields.
-        """
+        """Describe supported configuration, without client creation or I/O."""
         return ProviderInfo(
             id="perplexity",
             display_name="Perplexity AI",
             credential_env_vars=["PERPLEXITY_API_KEY"],
-            capabilities=["streaming", "citations", "web_search"],
+            capabilities=["citations", "web_search"],
+            defaults={
+                "default_model": self.default_model,
+                "max_tokens": self.max_tokens,
+                "max_steps": self.max_steps,
+                "timeout": self.timeout,
+                "max_retries": self.max_retries,
+            },
             config_fields=[
                 ConfigField(
                     id="api_key",
@@ -210,19 +142,19 @@ class PerplexityProvider:
                     default="none",
                 ),
                 ConfigField(
-                    id="search_context_size",
-                    display_name="Search Context Size",
+                    id="search_type",
+                    display_name="Search Type",
                     field_type="choice",
-                    prompt="Amount of search context to include",
-                    choices=["low", "medium", "high"],
+                    prompt="Inherit vendor search type or select fast/web",
+                    choices=["inherit", "fast", "web"],
                     required=False,
-                    default="medium",
+                    default="inherit",
                 ),
             ],
         )
 
     def get_model_list_info(self) -> dict[str, Any]:
-        """Describe a static adapter catalog, not account/API enumeration."""
+        """Return fresh optional static-listing v1 metadata."""
         return {
             "version": 1,
             "source": "static",
@@ -236,395 +168,147 @@ class PerplexityProvider:
     async def list_models(
         self, *, filters: Mapping[str, object] | None = None
     ) -> list[ModelInfo]:
-        """Return filtered static metadata; never contacts the API.
+        """Return fresh static rows; zero limits mean UNKNOWN, not usable zero.
 
-        None uses configured defaults. An explicit mapping replaces them;
-        {} exposes the entire static catalog, including legacy model IDs.
-        Listing is a recommendation only and does not gate exact inference.
+        None uses the frozen configured policy; an explicit mapping replaces
+        it, including {} for all eight rows. Exact inference is independent.
         """
         policy = self._model_filters if filters is None else ModelFilters.parse(filters)
+        rows = (
+            ("agent-fast", "Agent Fast"),
+            ("agent-low", "Agent Low"),
+            ("agent-medium", "Agent Medium"),
+            ("agent-high", "Agent High"),
+            ("sonar", "Sonar (Agent Fast alias)"),
+            ("sonar-pro", "Sonar Pro (Agent Fast alias)"),
+            ("sonar-reasoning-pro", "Sonar Reasoning Pro (Agent Low alias)"),
+            ("sonar-deep-research", "Sonar Deep Research (Agent High alias)"),
+        )
         models = [
             ModelInfo(
-                id="sonar",
-                display_name="Sonar",
-                context_window=128000,
-                max_output_tokens=4096,
-                capabilities=["web_search", "citations", "streaming"],
-            ),
-            ModelInfo(
-                id="sonar-pro",
-                display_name="Sonar Pro",
-                context_window=200000,
-                max_output_tokens=8192,
-                capabilities=["web_search", "citations", "streaming", "deep_search"],
-            ),
-            ModelInfo(
-                id="sonar-reasoning",
-                display_name="Sonar Reasoning",
-                context_window=128000,
-                max_output_tokens=4096,
-                capabilities=["web_search", "citations", "streaming", "reasoning"],
-            ),
-            ModelInfo(
-                id="sonar-reasoning-pro",
-                display_name="Sonar Reasoning Pro",
-                context_window=128000,
-                max_output_tokens=8192,
-                capabilities=[
-                    "web_search",
-                    "citations",
-                    "streaming",
-                    "reasoning",
-                    "deep_search",
-                ],
-            ),
-            ModelInfo(
-                id="sonar-deep-research",
-                display_name="Sonar Deep Research",
-                context_window=128000,
-                max_output_tokens=8192,
-                capabilities=["web_search", "citations", "deep_research"],
-            ),
-            ModelInfo(
-                id="r1-1776",
-                display_name="R1-1776",
-                context_window=128000,
-                max_output_tokens=4096,
-                capabilities=["offline"],
-            ),
+                id=model_id,
+                display_name=display_name,
+                context_window=0,
+                max_output_tokens=0,
+                capabilities=["web_search", "citations"],
+                defaults={},
+                pricing=None,
+            )
+            for model_id, display_name in rows
         ]
         selected = set(policy.select([model.id for model in models]))
         return [model for model in models if model.id in selected]
 
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
-        """Complete a chat request using Perplexity API.
+        """Validate and complete one buffered native Agent Responses request.
 
-        Args:
-            request: Chat request with messages and parameters.
-            **kwargs: Additional parameters to override defaults.
-
-        Returns:
-            ChatResponse with the model's response and metadata.
-
-        Raises:
-            perplexity.APIError: On API errors after retries exhausted.
-            ValueError: If API key is not configured.
+        Direct kwargs replace request_options by presence; the pure helper owns
+        all option/history validation. Hooks are observations, not authorization.
+        SDK errors and task cancellation propagate without a second retry layer.
+        raw=True exposes full prompts with key-based (not text/PII) redaction.
         """
         request_options = kwargs.pop("request_options", None)
         if request_options is not None:
             if not isinstance(request_options, Mapping):
                 raise ValueError("request_options must be a mapping or None")
             kwargs = {**request_options, **kwargs}
-
-        # Convert messages to Perplexity format
-        system_prompt, messages = self._convert_messages(request.messages)
-
-        # Build request parameters
-        model: str = kwargs.get("model") or request.model or self.default_model
-        max_tokens: int = (
-            kwargs.get("max_tokens") or request.max_output_tokens or self.max_tokens
-        )
-        temperature: float | None = (
-            kwargs.get("temperature")
-            if kwargs.get("temperature") is not None
-            else (
-                request.temperature
-                if request.temperature is not None
-                else self.temperature
-            )
-        )
-
-        # Build web search options
-        web_search_options: _WebSearchOptions = {}
-
-        if self.search_domain_filter:
-            web_search_options["search_domain_filter"] = self.search_domain_filter
-
-        search_recency = (
-            kwargs.get("search_recency_filter") or self.search_recency_filter
-        )
-        if search_recency and search_recency != "none":
-            web_search_options["search_recency_filter"] = search_recency
-
-        search_context: Literal["low", "medium", "high"] = (
-            kwargs.get("search_context_size") or self.search_context_size
-        )
-        if search_context:
-            web_search_options["search_context_size"] = search_context
-
-        # Make API request using SDK
-        try:
-            if self.debug:
-                logger.debug(
-                    f"Perplexity request: model={model}, messages={len(messages)}"
+        route, built = build_agent_request(request, self.config, kwargs)
+        # Separate wire, raw and caller graphs before awaiting any observer.
+        params = deepcopy(built)
+        event: dict[str, object] = {
+            "provider": self.name,
+            "model": route.selector,
+            "messages_count": len(request.messages),
+            "metadata": {"api": "agent", "effort": route.effort},
+        }
+        if self.raw:
+            raw = request_body(built)
+            if "timeout" in built:
+                raw_timeout = built["timeout"]
+                raw["timeout"] = (
+                    raw_timeout.as_dict()
+                    if isinstance(raw_timeout, perplexity.Timeout)
+                    else raw_timeout
                 )
-
-            # Prepare messages for SDK (add system message if present)
-            sdk_messages: list[ChatMessageInput] = []
-            if system_prompt:
-                sdk_messages.append({"role": "system", "content": system_prompt})
-            sdk_messages.extend(messages)
-
-            params: _CompletionParams = {
-                "model": model,
-                "messages": sdk_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                # The generated request accepts null despite the SDK annotation.
-                "web_search_options": cast(
-                    WebSearchOptions, web_search_options if web_search_options else None
-                ),
-            }
-            if "timeout" in kwargs:
-                params["timeout"] = kwargs["timeout"]
+            event["raw"] = redact_secrets(deepcopy(raw))
+        if "timeout" in params:
+            timeout = params["timeout"]
+            if not isinstance(timeout, perplexity.Timeout):
+                params["timeout"] = perplexity.Timeout(timeout, connect=5.0, pool=5.0)
+        try:
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                event: dict[str, object] = {
-                    "provider": self.name,
-                    "model": model,
-                    "messages_count": len(sdk_messages),
+                await self.coordinator.hooks.emit("llm:request", deepcopy(event))
+            response = await self.client.responses.create(**params)
+            chat_response = convert_agent_response(response, route)
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                usage = chat_response.usage
+                event_usage: dict[str, int] = {
+                    "input_tokens": usage.input_tokens if usage else 0,
+                    "output_tokens": usage.output_tokens if usage else 0,
                 }
-                if self.raw:
-                    raw_params: dict[str, object] = dict(params)
-                    raw_timeout = raw_params.get("timeout")
-                    if isinstance(raw_timeout, perplexity.Timeout):
-                        raw_params["timeout"] = raw_timeout.as_dict()
-                    event["raw"] = redact_secrets(raw_params)
-                await self.coordinator.hooks.emit("llm:request", event)
-            if "timeout" in params:
-                timeout: float | perplexity.Timeout | None = params["timeout"]
-                if not isinstance(timeout, perplexity.Timeout):
-                    # None means no generation deadline, not unbounded connection
-                    # acquisition. Keep the same bounds as the configured client.
-                    # Normalize after raw capture so events retain JSON-safe values.
-                    params["timeout"] = perplexity.Timeout(
-                        timeout, connect=5.0, pool=5.0
-                    )
-            response = await self.client.chat.completions.create(**params)
-
-            # Convert SDK response to ChatResponse
-            chat_response = self._convert_sdk_response(response, model)
-
-            # Emit response event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                if usage:
+                    if usage.cache_read_tokens is not None:
+                        event_usage["cache_read_tokens"] = usage.cache_read_tokens
+                    if usage.cache_write_tokens is not None:
+                        event_usage["cache_write_tokens"] = usage.cache_write_tokens
+                metadata = chat_response.metadata or {}
                 await self.coordinator.hooks.emit(
                     "llm:response",
-                    {
-                        "provider": self.name,
-                        "model": model,
-                        "usage": {
-                            "input_tokens": chat_response.usage.input_tokens
-                            if chat_response.usage
-                            else 0,
-                            "output_tokens": chat_response.usage.output_tokens
-                            if chat_response.usage
-                            else 0,
-                        },
-                    },
+                    deepcopy(
+                        {
+                            "provider": self.name,
+                            "model": metadata.get("perplexity:model"),
+                            "requested_selector": route.selector,
+                            "usage": event_usage,
+                            "metadata": {
+                                "api": "agent",
+                                "status": metadata["perplexity:status"],
+                            },
+                        }
+                    ),
                 )
-
             return chat_response
-
-        except perplexity.RateLimitError as e:
-            logger.warning(f"Perplexity rate limit hit: {e}")
+        except perplexity.RateLimitError as error:
+            logger.warning(
+                "Perplexity rate limit: %s status=%d",
+                type(error).__name__,
+                error.status_code,
+            )
             raise
-        except perplexity.APIStatusError as e:
-            logger.error(f"Perplexity API error: {e.status_code} - {e.message}")
+        except perplexity.APIStatusError as error:
+            logger.error(
+                "Perplexity API error: %s status=%d",
+                type(error).__name__,
+                error.status_code,
+            )
             raise
-        except perplexity.APIConnectionError as e:
-            logger.error(f"Perplexity connection error: {e}")
+        except perplexity.APIConnectionError as error:
+            logger.error("Perplexity connection error: %s", type(error).__name__)
             raise
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
-        """Parse tool calls from response.
-
-        Perplexity does not support tool calling, so this always returns
-        an empty list.
-
-        Args:
-            response: The chat response to parse.
-
-        Returns:
-            Empty list (Perplexity doesn't support tools).
-        """
+        """Return no client calls; vendor-managed server search is not dispatched."""
         return []
-
-    def _convert_messages(
-        self, messages: list[Message]
-    ) -> tuple[str | None, list[ChatMessageInput]]:
-        """Convert Amplifier messages to Perplexity format.
-
-        Handles system, developer, user, assistant, and tool roles:
-        - system: Combined into single system prompt
-        - developer: Wrapped in context_file tags as user message
-        - user/assistant: Direct passthrough with text extraction
-        - tool: Skipped (not supported)
-
-        Args:
-            messages: List of Amplifier Message objects.
-
-        Returns:
-            Tuple of (system_prompt, conversation_messages).
-        """
-        system_parts: list[str] = []
-        conversation: list[ChatMessageInput] = []
-
-        for msg in messages:
-            role = msg.role
-
-            if role == "system":
-                text = self._extract_text_content(msg.content)
-                if text:
-                    system_parts.append(text)
-
-            elif role == "developer":
-                # Wrap developer context in tags and add as user message
-                text = self._extract_text_content(msg.content)
-                if text:
-                    wrapped = f"<context_file>\n{text}\n</context_file>"
-                    conversation.append({"role": "user", "content": wrapped})
-
-            elif role == "user":
-                text = self._extract_text_content(msg.content)
-                if text:
-                    conversation.append({"role": "user", "content": text})
-
-            elif role == "assistant":
-                text = self._extract_text_content(msg.content)
-                if text:
-                    conversation.append({"role": "assistant", "content": text})
-
-            elif role == "tool" and self.debug:
-                # Tool messages not supported, skip
-                logger.debug("Skipping tool message (not supported by Perplexity)")
-
-        system_prompt = "\n\n".join(system_parts) if system_parts else None
-        return system_prompt, conversation
-
-    def _extract_text_content(self, content: str | list[Any]) -> str:
-        """Extract text content from message content.
-
-        Args:
-            content: Either a string or list of content blocks.
-
-        Returns:
-            Extracted text as a single string.
-        """
-        if isinstance(content, str):
-            return content
-
-        # Handle list of content blocks
-        text_parts: list[str] = []
-        for block in content:
-            if isinstance(block, TextBlock):
-                text_parts.append(block.text)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif hasattr(block, "text"):
-                text_parts.append(attrgetter("text")(block))
-
-        return "\n".join(text_parts)
-
-    def _convert_sdk_response(self, response: Any, model: str) -> ChatResponse:
-        """Convert SDK response to Amplifier ChatResponse.
-
-        Args:
-            response: Response from Perplexity SDK.
-            model: Model used for the request.
-
-        Returns:
-            ChatResponse in Amplifier format.
-        """
-        # Extract content from SDK response
-        content = ""
-        if response.choices and len(response.choices) > 0:
-            choice = response.choices[0]
-            if choice.message and choice.message.content:
-                content = choice.message.content
-
-        # Extract citations if present
-        citations: list[str] = []
-        if hasattr(response, "citations") and response.citations:
-            citations = response.citations
-
-        # Build content with citations
-        full_content = content
-        if citations:
-            citation_text = "\n\n**Sources:**\n" + "\n".join(
-                f"- [{i + 1}] {url}" for i, url in enumerate(citations)
-            )
-            full_content = content + citation_text
-
-        # Extract usage
-        usage = None
-        if response.usage:
-            input_tokens = response.usage.prompt_tokens or 0
-            output_tokens = response.usage.completion_tokens or 0
-            usage = Usage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=input_tokens + output_tokens,
-            )
-
-        # Determine stop reason
-        stop_reason = "stop"
-        if response.choices and response.choices[0].finish_reason:
-            finish_reason = response.choices[0].finish_reason
-            if finish_reason == "length":
-                stop_reason = "length"
-            elif finish_reason == "stop":
-                stop_reason = "stop"
-
-        return ChatResponse(
-            content=[TextBlock(type="text", text=full_content)],
-            finish_reason=stop_reason,
-            usage=usage,
-            metadata={
-                "perplexity:response_id": response.id,
-                "perplexity:model": response.model or model,
-            },
-        )
 
 
 async def mount(
     coordinator: ModuleCoordinator, config: dict[str, Any] | None = None
 ) -> Any:
-    """Mount the Perplexity provider to an Amplifier coordinator.
-
-    This function is the entry point for module loading. It creates
-    the provider instance and registers it with the coordinator.
-
-    Args:
-        coordinator: The module coordinator to mount to.
-        config: Optional configuration dict.
-
-    Returns:
-        Cleanup function to unmount and close resources, or None if
-        API key is not available.
-    """
+    """Mount through Core, preferring explicit credentials, and return cleanup."""
     config = config or {}
-
-    # Get API key from config or environment
     api_key = config.get("api_key") or os.environ.get("PERPLEXITY_API_KEY")
-
     if not api_key:
         logger.warning(
             "Perplexity provider not mounted: PERPLEXITY_API_KEY not set. "
             "Set the environment variable or provide api_key in config."
         )
         return None
-
-    # Create provider instance
     provider = PerplexityProvider(
-        api_key=api_key,
-        config=config,
-        coordinator=coordinator,
+        api_key=api_key, config=config, coordinator=coordinator
     )
-
-    # Mount to coordinator
     await coordinator.mount("providers", provider, name=provider.name)
-    logger.info(f"Perplexity provider mounted with model: {provider.default_model}")
+    logger.info("Perplexity provider mounted")
 
-    # Return cleanup function
     async def cleanup() -> None:
         await provider.close()
         logger.debug("Perplexity provider cleanup complete")
